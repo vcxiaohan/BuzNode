@@ -1,0 +1,2 @@
+# 统一用 LF 换行，不依赖每个人电脑上的 git 配置；CRLF 的 shell 脚本在 Linux 上会直接报语法错误
+* text=auto eol=lf

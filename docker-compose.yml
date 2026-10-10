@@ -1,5 +1,6 @@
-# 本地一条命令启动整套服务：docker compose up -d --build
-# ECS 上用云 Redis 时，只启动 bff 和 mock：docker compose up -d bff mock
+# 服务器上用的编排文件：只从镜像仓库拉取镜像运行，服务器上不放源代码、不构建
+# REGISTRY、NAMESPACE、IMAGE_TAG 由部署脚本写进同目录的 .env，这样手动执行 docker compose logs、restart 时也用同一个版本
+# Redis 用云 Redis，地址在 .env.production 里，所以这里没有 redis 服务
 
 # Docker 默认不限制日志文件大小，必须配置，否则日志会把磁盘写满
 x-logging: &logging
@@ -10,10 +11,7 @@ x-logging: &logging
 
 services:
   bff:
-    build:
-      context: .
-      target: runtime
-    image: buz-node:latest
+    image: ${REGISTRY:?}/${NAMESPACE:?}/buz-node:${IMAGE_TAG:?}
     env_file: .env.production
     ports:
       - "3001:3001"
@@ -26,19 +24,12 @@ services:
     depends_on:
       - mock
 
+  # 模拟的下游服务，有真实的订单、商品、广告服务后去掉
   mock:
-    build:
-      context: .
-      target: mock
-    image: buz-node-mock:latest
+    image: ${REGISTRY:?}/${NAMESPACE:?}/buz-node-mock:${IMAGE_TAG:?}
     # 只暴露认证服务给本机，方便登录拿 token；订单、商品、广告服务只在 compose 内部网络里访问
     ports:
       - "127.0.0.1:4004:4004"
     init: true
-    restart: unless-stopped
-    logging: *logging
-
-  redis:
-    image: redis:7-alpine
     restart: unless-stopped
     logging: *logging

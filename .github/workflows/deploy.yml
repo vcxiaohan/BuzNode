@@ -1,0 +1,163 @@
+name: 构建并部署
+
+on:
+  push:
+    branches: [main]
+  # 在 GitHub 网页上手动运行：不填版本号就构建当前代码再部署；填了就跳过构建，直接部署这个版本，用来回滚
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "要部署的镜像版本（完整的 40 位 commit 号），用于回滚；不填则构建当前代码"
+        required: false
+        default: ""
+
+# 同一时间只跑一次部署；上一次还没结束时，新的排队等，不中途取消，避免部署到一半被打断
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # GitHub 的构建机器在国外，推送镜像走公网地址
+  REGISTRY_PUBLIC: crpi-0byo5ewg94ioyzjr.cn-hangzhou.personal.cr.aliyuncs.com
+  # ECS 和镜像仓库都在杭州，拉取镜像走专有网络（内网）地址，速度快、不产生流量费
+  REGISTRY_VPC: crpi-0byo5ewg94ioyzjr-vpc.cn-hangzhou.personal.cr.aliyuncs.com
+  NAMESPACE: vcxiaohan
+  # 用 git 提交号当镜像版本，线上跑的是哪次提交的代码一目了然；手动回滚时用填写的版本号
+  IMAGE_TAG: ${{ inputs.image_tag || github.sha }}
+
+jobs:
+  # 第一阶段：类型检查，不通过就不会构建和部署；回滚时镜像已经存在，跳过检查和构建
+  check:
+    if: ${{ !inputs.image_tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn typecheck
+
+  # 第二阶段：构建镜像并推送到阿里云 ACR
+  build:
+    needs: check
+    if: ${{ !inputs.image_tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_PUBLIC }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: 构建并推送 BFF 镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          # ECS 是 x86 架构
+          platforms: linux/amd64
+          # 构建机器在国外，直接用官方源
+          build-args: NPM_REGISTRY=https://registry.yarnpkg.com
+          push: true
+          provenance: false
+          tags: ${{ env.REGISTRY_PUBLIC }}/${{ env.NAMESPACE }}/buz-node:${{ env.IMAGE_TAG }}
+          # 用 GitHub 的缓存保存镜像层，依赖没变时不用重新安装
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime
+
+      - name: 构建并推送 mock 镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: mock
+          platforms: linux/amd64
+          build-args: NPM_REGISTRY=https://registry.yarnpkg.com
+          push: true
+          provenance: false
+          tags: ${{ env.REGISTRY_PUBLIC }}/${{ env.NAMESPACE }}/buz-node-mock:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=mock
+          cache-to: type=gha,mode=max,scope=mock
+
+  # 第三阶段：逐台部署到 ECS
+  # 应用服务器只有内网 IP，GitHub 的机器连不进去，先 SSH 到有公网 IP 的跳板机，再从跳板机跳到各台机器的内网 IP
+  deploy:
+    needs: build
+    # 正常发布：构建成功才部署；回滚：构建被跳过也要部署
+    # 不能只写 always()，否则类型检查失败导致构建被跳过时，也会继续部署
+    if: ${{ !cancelled() && (needs.build.result == 'success' || (inputs.image_tag != '' && needs.build.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    env:
+      BASTION_HOST: ${{ secrets.BASTION_HOST }}
+      # 所有应用服务器的内网 IP，空格分开
+      ECS_HOSTS: ${{ secrets.ECS_HOSTS }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 回滚时版本号是手填的，先确认 ACR 里有这个版本，填错了在这里就停下，不会动到任何一台服务器
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_PUBLIC }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: 确认镜像版本存在
+        run: |
+          for image in buz-node buz-node-mock; do
+            if ! docker manifest inspect "$REGISTRY_PUBLIC/$NAMESPACE/$image:$IMAGE_TAG" > /dev/null; then
+              echo "镜像不存在：$image:$IMAGE_TAG，请检查版本号是否填写正确"
+              exit 1
+            fi
+          done
+          echo "准备部署版本：$IMAGE_TAG"
+
+      - name: 配置 SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # 写成 SSH 配置，后面直接 ssh <内网IP>，会自动经过跳板机，跳板机和应用服务器用的是同一把私钥
+          cat > ~/.ssh/config <<EOF
+          Host bastion
+            HostName $BASTION_HOST
+            User $SSH_USER
+            IdentityFile ~/.ssh/deploy_key
+          EOF
+          for host in $ECS_HOSTS; do
+            cat >> ~/.ssh/config <<EOF
+          Host $host
+            User $SSH_USER
+            IdentityFile ~/.ssh/deploy_key
+            ProxyJump bastion
+            StrictHostKeyChecking accept-new
+          EOF
+          done
+
+          ssh-keyscan -H "$BASTION_HOST" >> ~/.ssh/known_hosts
+
+      # 一台一台发：前一台健康检查通过后，再等 CLB 把它判定为健康，才发下一台，保证任何时候至少有一台在接流量
+      # 某一台失败时，部署脚本会把它回滚到上一个版本，并且流水线在这里停下，后面的机器不会再发
+      - name: 逐台部署
+        env:
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          for host in $ECS_HOSTS; do
+            echo "========== 部署到 $host =========="
+            # 每次部署都用 Secrets 里的密码重新登录，换了密码只改 Secrets，新加机器也不用手动登录
+            # 密码从标准输入传过去，不出现在命令行参数里
+            echo "$ACR_PASSWORD" | ssh "$host" "docker login --username=$ACR_USERNAME --password-stdin $REGISTRY_VPC"
+            scp docker-compose.yml "$host:/opt/buz-node/docker-compose.yml"
+            ssh "$host" "bash -s -- $REGISTRY_VPC $NAMESPACE $IMAGE_TAG" < scripts/deploy.sh
+            echo "等待 CLB 把 $host 判定为健康"
+            sleep 15
+          done
