@@ -5,7 +5,7 @@ dotenv.config({ quiet: true });
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  PORT: z.coerce.number().default(3001),
+  PORT: z.coerce.number().default(3000),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   // 前面有几层代理（Nginx、七层 CLB）就填几，Express 才能从 X-Forwarded-For 里取到用户真实 IP
   TRUST_PROXY: z.coerce.number().int().min(0).default(0),

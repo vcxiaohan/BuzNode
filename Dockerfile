@@ -40,11 +40,11 @@ COPY package.json ./
 
 # 不用 root 运行，万一被攻破，攻击者拿到的权限也有限；node 用户是官方镜像自带的
 USER node
-EXPOSE 3001
+EXPOSE 3000
 
 # alpine 镜像里没有 curl，用 Node 自带的 fetch 请求 /health
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3001) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 # 必须直接用 node 启动，不能用 yarn start：用 yarn 启动的话，docker stop 发的 SIGTERM 到不了 node 进程，优雅退出不会执行
 CMD ["node", "dist/server.js"]

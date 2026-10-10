@@ -24,7 +24,7 @@ EOF
 # 最多等 60 秒，/ready 返回 200 才算部署成功
 wait_ready() {
   for _ in $(seq 1 30); do
-    if curl -sf http://127.0.0.1:3001/ready > /dev/null; then
+    if curl -sf http://127.0.0.1:3000/ready > /dev/null; then
       return 0
     fi
     sleep 2
