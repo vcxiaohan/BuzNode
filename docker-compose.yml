@@ -1,0 +1,44 @@
+# 本地一条命令启动整套服务：docker compose up -d --build
+# ECS 上用云 Redis 时，只启动 bff 和 mock：docker compose up -d bff mock
+
+# Docker 默认不限制日志文件大小，必须配置，否则日志会把磁盘写满
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "100m" # 单个日志文件最大 100MB
+    max-file: "3" # 最多保留 3 个，超出后删除最旧的
+
+services:
+  bff:
+    build:
+      context: .
+      target: runtime
+    image: buz-node:latest
+    env_file: .env.production
+    ports:
+      - "3001:3001"
+    # 用一个很小的 init 进程当 1 号进程，负责转发信号、回收僵尸进程
+    init: true
+    restart: unless-stopped
+    # docker stop 默认等 10 秒就强制杀掉，要比代码里的强制退出时间（15 秒）长
+    stop_grace_period: 20s
+    logging: *logging
+    depends_on:
+      - mock
+
+  mock:
+    build:
+      context: .
+      target: mock
+    image: buz-node-mock:latest
+    # 只暴露认证服务给本机，方便登录拿 token；订单、商品、广告服务只在 compose 内部网络里访问
+    ports:
+      - "127.0.0.1:4004:4004"
+    init: true
+    restart: unless-stopped
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *logging
